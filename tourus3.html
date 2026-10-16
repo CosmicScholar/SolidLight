@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AresCore: 3D Dimensional Breach</title>
+    <style>
+        body { margin: 0; background: black; overflow: hidden; color: #00ff00; font-family: monospace; }
+        canvas { width: 100vw; height: 100vh; display: block; cursor: crosshair; }
+        #overlay { position: absolute; top: 10px; left: 10px; pointer-events: none; text-shadow: 0 0 5px #00ff00; }
+    </style>
+</head>
+<body>
+    <div id="overlay">ARESCORE STATUS: 16.7M NODES // KEYWORD COLLISION RESOLVED</div>
+    <canvas id="aresCanvas"></canvas>
+
+    <script type="module">
+        const canvas = document.getElementById('aresCanvas');
+        let rot = { x: 0.8, y: 0.3 };
+        let zoom = 1.8;
+        let drag = false;
+
+        // Interaction: The Temporal Pincer Controls
+        canvas.onmousedown = () => drag = true;
+        window.onmouseup = () => drag = false;
+        window.onmousemove = (e) => { if(drag) { rot.x += e.movementX*0.005; rot.y += e.movementY*0.005; } };
+        window.onwheel = (e) => { zoom += e.deltaY * 0.001; zoom = Math.max(0.5, Math.min(5.0, zoom)); };
+
+        async function init() {
+            if (!navigator.gpu) return alert("WebGPU not supported");
+            const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+            const device = await adapter.requestDevice({
+                requiredLimits: {
+                    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+                    maxBufferSize: adapter.limits.maxBufferSize
+                }
+            });
+
+            const context = canvas.getContext('webgpu');
+            const format = navigator.gpu.getPreferredCanvasFormat();
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            context.configure({ device, format, alphaMode: 'premultiplied' });
+
+            const shaderCode = `
+                struct Params { 
+                    strongForce: f32, viscosity: f32, uncertainty: f32, deltaTime: f32, 
+                    rotX: f32, rotY: f32, zoom: f32, p3: f32 
+                }
+                @group(0) @binding(0) var<uniform> params: Params;
+                @group(0) @binding(1) var<storage, read> inP: array<vec4<f32>>;
+                @group(0) @binding(2) var<storage, read_write> outP: array<vec4<f32>>;
+
+                @compute @workgroup_size(16, 16) 
+                fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+                    let i = id.y * 4096u + id.x; 
+                    if (i >= arrayLength(&inP)) { return; }
+                    var p = inP[i];
+                    var pos = p.xyz;
+                    var layerId = p.w; // RENAMED FROM 'type' TO AVOID RESERVED KEYWORD
+                    
+                    let dist = length(pos);
+                    let radiusSq = dot(pos, pos);
+                    let B = vec3<f32>((3.0*pos.x*pos.z), (3.0*pos.y*pos.z), (3.0*pos.z*pos.z-radiusSq)) / (radiusSq*dist+0.001) * params.uncertainty;
+                    
+                    let speed = (1.2 - layerId) * 0.5;
+                    let vel = vec3<f32>(-pos.y, pos.x, sin(layerId * 3.14)) * speed;
+                    pos += (cross(vel, B) + vel * 0.1) * params.deltaTime;
+                    
+                    if (dist < 0.3) { pos += normalize(pos) * (0.3 - dist) * 1.5; }
+                    else { pos -= normalize(pos) * (dist * params.strongForce * 0.01); }
+                    
+                    outP[i] = vec4<f32>(pos * params.viscosity, layerId);
+                }
+
+                struct VertexOut {
+                    @builtin(position) pos: vec4<f32>,
+                    @location(0) color: vec4<f32>
+                }
+
+                @vertex fn vs(@builtin(vertex_index) i: u32) -> VertexOut {
+                    var vOut: VertexOut;
+                    var p = inP[i].xyz;
+                    let lId = inP[i].w;
+                    
+                    let cX = cos(params.rotX); let sX = sin(params.rotX);
+                    let cY = cos(params.rotY); let sY = sin(params.rotY);
+                    
+                    let y1 = p.y * cY - p.z * sY;
+                    let z1 = p.y * sY + p.z * cY;
+                    let x1 = p.x * cX + z1 * sX;
+                    let z2 = -p.x * sX + z1 * cX;
+
+                    let aspect = f32(${canvas.width}) / f32(${canvas.height});
+                    let pSize = params.zoom + z2; 
+                    vOut.pos = vec4<f32>(x1 / (aspect * pSize), y1 / pSize, z2 * 0.1, 1.0);
+                    
+                    var col: vec3<f32>;
+                    if (lId < 0.33) { col = vec3<f32>(1.0, 0.1, 0.1); } 
+                    else if (lId < 0.66) { col = vec3<f32>(0.1, 1.0, 0.1); } 
+                    else { col = vec3<f32>(0.2, 0.4, 1.0); }
+                    
+                    vOut.color = vec4<f32>(col * (0.5 + z2 * 0.5), 0.4);
+                    return vOut;
+                }
+
+                @fragment fn fs(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> { return color; }
+            `;
+
+            const module = device.createShaderModule({ code: shaderCode });
+            const bindGroupLayout = device.createBindGroupLayout({
+                entries: [
+                    { binding: 0, visibility: GPUShaderStage.COMPUTE | GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+                    { binding: 1, visibility: GPUShaderStage.COMPUTE | GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+                    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+                ]
+            });
+
+            const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+            const computePipe = device.createComputePipeline({ layout: pipelineLayout, compute: { module, entryPoint: 'main' } });
+            const renderPipe = device.createRenderPipeline({
+                layout: pipelineLayout,
+                vertex: { module, entryPoint: 'vs' },
+                fragment: { module, entryPoint: 'fs', targets: [{ format, blend: { color: { operation: 'add', srcFactor: 'src-alpha', dstFactor: 'one' }, alpha: {} } }] },
+                primitive: { topology: 'point-list' }
+            });
+
+            const numPoints = 16777216; 
+            const data = new Float32Array(numPoints * 4);
+            for(let i=0; i<numPoints*4; i+=4) {
+                data[i] = (Math.random()-0.5)*3.0; 
+                data[i+1] = (Math.random()-0.5)*3.0;
+                data[i+2] = (Math.random()-0.5)*3.0; 
+                data[i+3] = Math.random();
+            }
+
+            const b1 = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.VERTEX });
+            const b2 = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.VERTEX });
+            device.queue.writeBuffer(b1, 0, data);
+
+            const pBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            const bindGroup = device.createBindGroup({
+                layout: bindGroupLayout,
+                entries: [{ binding: 0, resource: { buffer: pBuf } }, { binding: 1, resource: { buffer: b1 } }, { binding: 2, resource: { buffer: b2 } }]
+            });
+
+            function frame() {
+                device.queue.writeBuffer(pBuf, 0, new Float32Array([0.005, 0.995, 6.0, 0.016, rot.x, rot.y, zoom, 0]));
+                const encoder = device.createCommandEncoder();
+                const compute = encoder.beginComputePass();
+                compute.setPipeline(computePipe); compute.setBindGroup(0, bindGroup);
+                compute.dispatchWorkgroups(256, 256); compute.end();
+                encoder.copyBufferToBuffer(b2, 0, b1, 0, data.byteLength);
+
+                const render = encoder.beginRenderPass({
+                    colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', clearValue: [0,0,0,1], storeOp: 'store' }]
+                });
+                render.setPipeline(renderPipe); render.setBindGroup(0, bindGroup);
+                render.draw(numPoints); render.end();
+                device.queue.submit([encoder.finish()]);
+                requestAnimationFrame(frame);
+            }
+            frame();
+        }
+        init();
+    </script>
+</body>
+</html>
