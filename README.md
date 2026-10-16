@@ -54,3 +54,7 @@ While AresCore is an artistic and mathematical simulation rather than a strict e
 ### 3. Quantum Field & Topological Manifolds (`qc3_scale`)
 * **The Sim Terminology:** The use of terms like `uncertainty`, `qc3_scale`, and `strongForce` references subatomic quantum mechanics.
 * **Real-World Application:** While the math in the shader is classical vector calculus rather than quantum wavefunctions, the concept of a "manifold force" acting as a strict spatial boundary mimics **quantum confinement** (e.g., electrons trapped in quantum dots or energy wells) where particles are restricted to discrete geometric probability shells.
+
+
+### Remarks ###
+If you had to classify what these files are doing from a physicist's perspective, they are real-time numerical solvers for non-linear dynamical systems on a toroidal/spherical manifold. They simulate what it would look like if you injected 16 million charged particles into a synthetic, self-intersecting magnetic bottle and watched them self-organize via cross-field tension and centripetal damping.
