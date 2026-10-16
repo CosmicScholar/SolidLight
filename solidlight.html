@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AresCore: Solid-Light Manifold [Stabilized]</title>
+    <style>
+        body { margin: 0; background: black; overflow: hidden; color: #00f0ff; font-family: monospace; }
+        canvas { width: 100vw; height: 100vh; display: block; cursor: crosshair; }
+        #overlay { 
+            position: absolute; top: 10px; left: 10px; pointer-events: none; 
+            text-shadow: 0 0 8px #00f0ff; background: rgba(0,0,0,0.5); padding: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">
+        ARESCORE STATUS: 8.3M NODES ONLINE<br>
+        PHASE: SOLID-LIGHT MANIFOLD ACTIVE<br>
+        PIPELINE: EXPLICIT BINDING ALIGNMENT
+    </div>
+    <canvas id="aresCanvas"></canvas>
+
+    <script type="module">
+        const canvas = document.getElementById('aresCanvas');
+        const adapter = await navigator.gpu.requestAdapter();
+        const device = await adapter.requestDevice();
+        const context = canvas.getContext('webgpu');
+        const format = navigator.gpu.getPreferredCanvasFormat();
+        context.configure({ device, format });
+
+        let rot = { x: 0.8, y: 0.3 };
+        let zoom = 1.8;
+        let drag = false;
+
+        canvas.onmousedown = () => drag = true;
+        window.onmouseup = () => drag = false;
+        window.onmousemove = (e) => { if(drag) { rot.x += e.movementX*0.005; rot.y += e.movementY*0.005; } };
+        window.onwheel = (e) => zoom += e.deltaY * 0.001;
+
+        const numPoints = 8388608; 
+        const data = new Float32Array(numPoints * 4);
+        for(let i=0; i<data.length; i+=4) {
+            data[i] = (Math.random()-0.5)*0.5;
+            data[i+1] = (Math.random()-0.5)*0.5;
+            data[i+2] = (Math.random()-0.5)*0.5;
+            data[i+3] = (i/4) % 3; 
+        }
+
+        const shaderCode = `
+            struct Params {
+                strongForce: f32,
+                viscosity: f32,
+                uncertainty: f32,
+                deltaTime: f32,
+                rotX: f32,
+                rotY: f32,
+                zoom: f32,
+                qc3_scale: f32
+            };
+
+            @group(0) @binding(0) var<uniform> params : Params;
+            @group(0) @binding(1) var<storage, read> b1 : array<vec4<f32>>;
+            @group(0) @binding(2) var<storage, read_write> b2 : array<vec4<f32>>;
+
+            @compute @workgroup_size(256)
+            fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+                let idx = id.x;
+                if (idx >= ${numPoints}u) { return; }
+
+                var state = b1[idx];
+                var pos = state.xyz;
+                let layerId = state.w;
+                let dist = length(pos);
+                
+                let B = vec3<f32>((3.0*pos.x*pos.z), (3.0*pos.y*pos.z), (3.0*pos.z*pos.z-0.09)) / (0.09*dist + 0.001);
+                let vel = cross(pos, B) * params.uncertainty;
+                let stretch = length(cross(vel, B));
+                
+                let S = 1.0 / (1.0 + exp(-params.qc3_scale * (stretch - 1.2)));
+                let manifoldForce = normalize(cross(pos, vec3<f32>(0.0, 1.0, 0.0))) * 0.1;
+                let update = mix(vel, manifoldForce, S);
+
+                pos += (update + (pos * (0.3 - dist) * params.strongForce)) * params.deltaTime;
+                if(length(pos) > 2.0) { pos = normalize(pos) * 0.1; }
+                b2[idx] = vec4<f32>(pos, layerId);
+            }
+
+            @vertex
+            fn vs(@builtin(vertex_index) vid : u32) -> @builtin(position) vec4<f32> {
+                let p = b1[vid].xyz;
+                // Note: vertex shader doesn't use binding 2 (b2), but we must define the layout to match the BindGroup
+                var pos = vec3<f32>(
+                    p.x * cos(params.rotX) - p.z * sin(params.rotX),
+                    p.y * cos(params.rotY) - (p.x * sin(params.rotX) + p.z * cos(params.rotX)) * sin(params.rotY),
+                    p.y * sin(params.rotY) + (p.x * sin(params.rotX) + p.z * cos(params.rotX)) * cos(params.rotY)
+                );
+                return vec4<f32>(pos * params.zoom, 1.0);
+            }
+
+            @fragment
+            fn fs() -> @location(0) vec4<f32> {
+                return vec4<f32>(0.2, 0.8, 1.0, 0.4); 
+            }
+        `;
+
+        const module = device.createShaderModule({ code: shaderCode });
+
+        // EXPLICIT LAYOUT: Both pipes now share this "contract"
+        const bindGroupLayout = device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.COMPUTE | GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+                { binding: 1, visibility: GPUShaderStage.COMPUTE | GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+                { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } } // Still needed in the layout for the compute pass
+            ]
+        });
+
+        const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+
+        const computePipe = device.createComputePipeline({ layout: pipelineLayout, compute: { module, entryPoint: 'main' } });
+        const renderPipe = device.createRenderPipeline({
+            layout: pipelineLayout,
+            vertex: { module, entryPoint: 'vs' },
+            fragment: { module, entryPoint: 'fs', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one' }, alpha: {} } }] },
+            primitive: { topology: 'point-list' }
+        });
+
+        const b1 = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+        const b2 = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+        device.queue.writeBuffer(b1, 0, data);
+
+        const pBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+        // ONE BIND GROUP: Shared because layouts are now identical
+        const mainBindGroup = device.createBindGroup({
+            layout: bindGroupLayout,
+            entries: [
+                { binding: 0, resource: { buffer: pBuf } },
+                { binding: 1, resource: { buffer: b1 } },
+                { binding: 2, resource: { buffer: b2 } }
+            ]
+        });
+
+        function frame() {
+            device.queue.writeBuffer(pBuf, 0, new Float32Array([4.0, 0.98, 8.0, 0.01, rot.x, rot.y, zoom, 8.0]));
+            const encoder = device.createCommandEncoder();
+            
+            const compute = encoder.beginComputePass();
+            compute.setPipeline(computePipe);
+            compute.setBindGroup(0, mainBindGroup);
+            compute.dispatchWorkgroups(Math.ceil(numPoints / 256));
+            compute.end();
+
+            encoder.copyBufferToBuffer(b2, 0, b1, 0, data.byteLength);
+
+            const render = encoder.beginRenderPass({
+                colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', clearValue: [0,0,0,1], storeOp: 'store' }]
+            });
+            render.setPipeline(renderPipe);
+            render.setBindGroup(0, mainBindGroup);
+            render.draw(numPoints);
+            render.end();
+
+            device.queue.submit([encoder.finish()]);
+            requestAnimationFrame(frame);
+        }
+        frame();
+    </script>
+</body>
+</html>
